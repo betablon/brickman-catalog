@@ -19,6 +19,8 @@ jobs:
           python-version: "3.12"
 
       - name: Build catalog
+        env:
+          BRICKSET_API_KEY: ${{ secrets.BRICKSET_API_KEY }}
         run: python scripts/build_catalog.py catalog.json.z
 
       - name: Create Release

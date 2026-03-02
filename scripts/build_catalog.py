@@ -17,13 +17,16 @@ import csv
 import gzip
 import io
 import json
+import os
 import sys
+import urllib.parse
 import urllib.request
 import zlib
 from datetime import datetime, timezone
 
 BASE_URL = "https://cdn.rebrickable.com/media/downloads/"
 FILES = ["sets.csv.gz", "themes.csv.gz", "inventories.csv.gz", "inventory_minifigs.csv.gz"]
+BRICKSET_API_URL = "https://brickset.com/api/v3.asmx"
 
 
 def download_csv(filename: str) -> list[dict]:
@@ -96,6 +99,50 @@ def build_minifig_counts(minifig_rows: list[dict]) -> dict:
     return counts
 
 
+def fetch_brickset_release_dates(api_key: str, years: list[int]) -> dict[str, str]:
+    """Fetch release dates from Brickset API for the given years.
+    Returns a dict of set_num (e.g. '72152-1') -> date string (e.g. '2026-03-01T00:00:00Z').
+    """
+    dates: dict[str, str] = {}
+    for year in years:
+        page = 1
+        while True:
+            params_json = f"{{'year':'{year}','pageSize':'500','pageNumber':'{page}'}}"
+            body = urllib.parse.urlencode({
+                "apiKey": api_key,
+                "userHash": "",
+                "params": params_json,
+            }).encode()
+            req = urllib.request.Request(
+                f"{BRICKSET_API_URL}/getSets",
+                data=body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read())
+            sets = data.get("sets") or []
+            for s in sets:
+                num = s.get("number", "")
+                variant = s.get("numberVariant", 1)
+                set_key = f"{num}-{variant}"
+                lego_com = s.get("LEGOCom") or {}
+                for region in ("US", "UK", "DE"):
+                    region_data = lego_com.get(region) or {}
+                    date_str = region_data.get("dateFirstAvailable")
+                    if date_str:
+                        dates[set_key] = date_str
+                        break
+            print(f"  Brickset year={year} page={page}: {len(sets)} sets")
+            if len(sets) < 500:
+                break
+            page += 1
+    print(f"  Brickset release dates fetched: {len(dates)}")
+    return dates
+
+
 def split_set_num(set_num: str) -> tuple[str, int]:
     """Split '75192-1' into ('75192', 1)."""
     if "-" in set_num:
@@ -127,6 +174,18 @@ def main():
     # Step 3: Minifig counts
     mf_counts = build_minifig_counts(minifig_rows)
 
+    # Step 3b: Fetch release dates from Brickset (current + previous year)
+    release_dates: dict[str, str] = {}
+    brickset_api_key = os.environ.get("BRICKSET_API_KEY", "")
+    if brickset_api_key:
+        current_year = datetime.now(timezone.utc).year
+        print("Fetching release dates from Brickset ...")
+        release_dates = fetch_brickset_release_dates(
+            brickset_api_key, [current_year - 1, current_year]
+        )
+    else:
+        print("BRICKSET_API_KEY not set, skipping release dates")
+
     # Step 4: Process sets
     catalog_sets = []
     theme_stats = {}  # theme -> {sets: count, subthemes: set(), year_from, year_to}
@@ -153,6 +212,9 @@ def main():
         inv_id = inv_map.get(set_num)
         mf = mf_counts.get(inv_id, 0) if inv_id else 0
 
+        # Release date from Brickset
+        rd = release_dates.get(set_num)
+
         entry = {"n": number, "v": variant, "nm": name, "y": year, "t": theme}
         if subtheme:
             entry["st"] = subtheme
@@ -162,6 +224,8 @@ def main():
             entry["mf"] = mf
         if img_url:
             entry["img"] = img_url
+        if rd:
+            entry["rd"] = rd
 
         catalog_sets.append(entry)
 
