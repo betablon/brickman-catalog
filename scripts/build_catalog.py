@@ -1,118 +1,76 @@
 #!/usr/bin/env python3
 """
-Downloads Rebrickable CSV bulk exports and produces a compact catalog.json.z
-for the Brickman iOS app. Python stdlib only — no pip dependencies.
+Builds catalog.json.z for the Brickman iOS app, sourced entirely from Brickset.
 
-Output uses zlib compression (RFC 1950) which Apple's Compression framework
-handles natively via NSData.decompressed(using: .zlib).
+Every entry carries a real Brickset `setID`. That is the point of this build:
+the app no longer has to invent a synthetic identifier, so the whole class of
+bug around `LegoSet.setID` being unique-keyed — a synthetic collision quietly
+overwriting an unrelated row — cannot arise from catalog data, and adding a set
+no longer needs a blocking API round trip to resolve its real ID.
+
+Quota: only getSets counts against the key, and the default cap is 100/day.
+  * a full build is ~47 calls  (23,500 sets at pageSize 500)
+  * a delta build is ~1 call   (updatedSince, seeded from the last release)
+
+An unfiltered getSets is rejected ("No valid parameters"), but `year` accepts a
+comma-delimited list, so the whole corpus pages as a single query.
+
+Python stdlib only. Output is zlib (RFC 1950), which Apple's Compression
+framework reads via NSData.decompressed(using: .zlib).
 
 Usage:
-    python scripts/build_catalog.py              # writes catalog.json.z to cwd
-    python scripts/build_catalog.py output.json.z
+    python scripts/build_catalog.py                 # delta build
+    python scripts/build_catalog.py out.json.z      # delta, explicit output
+    python scripts/build_catalog.py --full          # full rebuild
+    python scripts/build_catalog.py --years 2026    # limited, for testing
 """
 
 from __future__ import annotations
 
-import csv
-import gzip
-import io
+import argparse
 import json
 import os
-import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-BASE_URL = "https://cdn.rebrickable.com/media/downloads/"
-FILES = ["sets.csv.gz", "themes.csv.gz", "inventories.csv.gz", "inventory_minifigs.csv.gz"]
 BRICKSET_API_URL = "https://brickset.com/api/v3.asmx"
+LATEST_RELEASE_URL = (
+    "https://api.github.com/repos/betablon/brickman-catalog/releases/latest"
+)
+
+# 1949 is the earliest set Brickset holds. The upper bound runs deliberately
+# ahead of the current year so next season's announcements aren't dropped —
+# the previous build only covered two years, which is why 2027 sets never got
+# a release date.
+FIRST_YEAR = 1949
+YEARS_AHEAD = 2
+
+PAGE_SIZE = 500
+
+# How far back a delta reaches beyond the last build, as insurance against a
+# missed or partial run.
+DELTA_OVERLAP_DAYS = 3
 
 
-def download_csv(filename: str) -> list[dict]:
-    """Download a gzipped CSV from Rebrickable and return rows as dicts."""
-    url = BASE_URL + filename
-    print(f"Downloading {url} ...")
-    with urllib.request.urlopen(url) as resp:
-        raw = resp.read()
-    with gzip.open(io.BytesIO(raw), "rt", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+# --------------------------------------------------------------------------
+# Brickset
+# --------------------------------------------------------------------------
 
 
-def build_theme_lookup(themes_rows: list[dict]) -> dict:
-    """Build theme_id -> {name, parent_id} lookup and resolve root ancestors."""
-    by_id = {}
-    for row in themes_rows:
-        tid = int(row["id"])
-        parent = row["parent_id"].strip()
-        by_id[tid] = {
-            "name": row["name"],
-            "parent_id": int(parent) if parent else None,
-        }
+def brickset_get_sets(api_key: str, params: dict) -> dict:
+    """One getSets call. Params go through json.dumps, never string formatting —
+    a set name with an apostrophe otherwise produces malformed JSON."""
+    body = urllib.parse.urlencode(
+        {"apiKey": api_key, "userHash": "", "params": json.dumps(params)}
+    ).encode()
 
-    def root_ancestor(tid: int) -> str:
-        visited = set()
-        current = tid
-        while by_id[current]["parent_id"] is not None and current not in visited:
-            visited.add(current)
-            current = by_id[current]["parent_id"]
-        return by_id[current]["name"]
-
-    def direct_parent_name(tid: int) -> str | None:
-        pid = by_id[tid]["parent_id"]
-        if pid is None:
-            return None
-        return by_id[pid]["name"]
-
-    lookup = {}
-    for tid, info in by_id.items():
-        root = root_ancestor(tid)
-        # subtheme = this theme's own name if it has a parent, else None
-        if info["parent_id"] is not None:
-            subtheme = info["name"]
-        else:
-            subtheme = None
-        lookup[tid] = {"theme": root, "subtheme": subtheme}
-
-    return lookup
-
-
-def build_inventory_map(inventories_rows: list[dict]) -> dict:
-    """Build set_num -> highest-version inventory_id."""
-    best = {}  # set_num -> (version, inventory_id)
-    for row in inventories_rows:
-        set_num = row["set_num"]
-        version = int(row["version"])
-        inv_id = int(row["id"])
-        if set_num not in best or version > best[set_num][0]:
-            best[set_num] = (version, inv_id)
-    return {sn: inv_id for sn, (_, inv_id) in best.items()}
-
-
-def build_minifig_counts(minifig_rows: list[dict]) -> dict:
-    """Build inventory_id -> total minifig count."""
-    counts = {}
-    for row in minifig_rows:
-        inv_id = int(row["inventory_id"])
-        qty = int(row["quantity"])
-        counts[inv_id] = counts.get(inv_id, 0) + qty
-    return counts
-
-
-def fetch_brickset_release_dates(api_key: str, years: list[int]) -> dict[str, str]:
-    """Fetch release dates from Brickset API for the given years.
-    Returns a dict of set_num (e.g. '72152-1') -> date string (e.g. '2026-03-01T00:00:00Z').
-    """
-    dates: dict[str, str] = {}
-    for year in years:
-        page = 1
-        while True:
-            params_json = f"{{'year':'{year}','pageSize':'500','pageNumber':'{page}'}}"
-            body = urllib.parse.urlencode({
-                "apiKey": api_key,
-                "userHash": "",
-                "params": params_json,
-            }).encode()
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
             req = urllib.request.Request(
                 f"{BRICKSET_API_URL}/getSets",
                 data=body,
@@ -121,159 +79,298 @@ def fetch_brickset_release_dates(api_key: str, years: list[int]) -> dict[str, st
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read())
-            sets = data.get("sets") or []
-            for s in sets:
-                num = s.get("number", "")
-                variant = s.get("numberVariant", 1)
-                set_key = f"{num}-{variant}"
-                lego_com = s.get("LEGOCom") or {}
-                for region in ("US", "UK", "DE"):
-                    region_data = lego_com.get(region) or {}
-                    date_str = region_data.get("dateFirstAvailable")
-                    if date_str:
-                        dates[set_key] = date_str
-                        break
-            print(f"  Brickset year={year} page={page}: {len(sets)} sets")
-            if len(sets) < 500:
+            break
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt == 2:
+                raise RuntimeError(f"Brickset request failed: {exc}") from exc
+            time.sleep(2**attempt)
+    else:  # pragma: no cover - the loop always breaks or raises
+        raise RuntimeError(f"Brickset request failed: {last_error}")
+
+    if data.get("status") != "success":
+        raise RuntimeError(f"Brickset error: {data.get('message')!r}")
+    return data
+
+
+def all_years() -> str:
+    last = datetime.now(timezone.utc).year + YEARS_AHEAD
+    return ",".join(str(y) for y in range(FIRST_YEAR, last + 1))
+
+
+def entry_key(number: str, variant) -> str:
+    """The identity a set is merged on across builds.
+
+    Brickset returns numbers with stray surrounding whitespace on a real
+    minority of records (" 6626055"); unstripped, those drop out of any merge.
+    """
+    try:
+        v = int(variant)
+    except (TypeError, ValueError):
+        v = 1
+    return f"{str(number).strip()}-{v}"
+
+
+def to_entry(s: dict) -> dict | None:
+    """Reduce a Brickset record to the compact catalog shape.
+
+    Keys stay short because the whole file ships to the phone: n/v/nm/y/t are
+    required by the app's decoder, everything else is omitted when absent.
+    """
+    number = str(s.get("number") or "").strip()
+    name = s.get("name")
+    theme = s.get("theme")
+    year = s.get("year")
+    set_id = s.get("setID")
+
+    # Without these the record can't be rendered or identified, so skip it
+    # rather than emit something the app's non-optional decoding will reject.
+    if not (number and name and theme and isinstance(year, int) and year > 0):
+        return None
+    if not (isinstance(set_id, int) and set_id > 0):
+        return None
+
+    try:
+        variant = int(s.get("numberVariant") or 1)
+    except (TypeError, ValueError):
+        variant = 1
+
+    entry = {
+        "n": number,
+        "v": variant,
+        "nm": name,
+        "y": year,
+        "t": theme,
+        "sid": set_id,
+    }
+
+    if s.get("subtheme"):
+        entry["st"] = s["subtheme"]
+    if isinstance(s.get("pieces"), int) and s["pieces"] > 0:
+        entry["p"] = s["pieces"]
+    if isinstance(s.get("minifigs"), int) and s["minifigs"] > 0:
+        entry["mf"] = s["minifigs"]
+
+    image = s.get("image") or {}
+    if image.get("imageURL"):
+        entry["img"] = image["imageURL"]
+
+    # launchDate covers ~84% of recent sets against ~72% for the LEGO.com
+    # per-region dateFirstAvailable, so it leads and the regional date backfills.
+    date = s.get("launchDate")
+    if not date:
+        lego_com = s.get("LEGOCom") or {}
+        for region in ("US", "UK", "DE"):
+            date = (lego_com.get(region) or {}).get("dateFirstAvailable")
+            if date:
                 break
-            page += 1
-    print(f"  Brickset release dates fetched: {len(dates)}")
-    return dates
+    if date:
+        entry["rd"] = date
+
+    if isinstance(s.get("released"), bool):
+        entry["rel"] = s["released"]
+
+    # Brickset's own classification (Normal, Gear, Book, Promotional, ...).
+    # Carried because it is a far steadier basis for content filters than
+    # matching on theme names, which is what the Rebrickable build relied on.
+    if s.get("category"):
+        entry["cat"] = s["category"]
+    if s.get("themeGroup"):
+        entry["tg"] = s["themeGroup"]
+
+    return entry
 
 
-def split_set_num(set_num: str) -> tuple[str, int]:
-    """Split '75192-1' into ('75192', 1)."""
-    if "-" in set_num:
-        parts = set_num.rsplit("-", 1)
-        try:
-            return parts[0], int(parts[1])
-        except ValueError:
-            return set_num, 1
-    return set_num, 1
+def fetch_sets(api_key: str, years: str, since: str | None) -> tuple[dict, int]:
+    """Page getSets into {key: entry}. `since` (yyyy-mm-dd) makes it a delta."""
+    entries: dict[str, dict] = {}
+    calls = 0
+    page = 1
+    skipped = 0
+
+    while True:
+        params = {"year": years, "pageSize": str(PAGE_SIZE), "pageNumber": str(page)}
+        if since:
+            params["updatedSince"] = since
+
+        data = brickset_get_sets(api_key, params)
+        calls += 1
+        sets = data.get("sets") or []
+
+        for s in sets:
+            entry = to_entry(s)
+            if entry is None:
+                skipped += 1
+                continue
+            entries[entry_key(entry["n"], entry["v"])] = entry
+
+        if page == 1:
+            print(f"  Brickset reports {data.get('matches')} matching sets")
+        print(f"  page {page}: {len(sets)} sets  (kept {len(entries)})")
+
+        if len(sets) < PAGE_SIZE:
+            break
+        page += 1
+
+    if skipped:
+        print(f"  skipped {skipped} record(s) missing a required field")
+    return entries, calls
 
 
-def main():
-    output_path = sys.argv[1] if len(sys.argv) > 1 else "catalog.json.z"
-
-    # Download all CSVs
-    sets_rows = download_csv("sets.csv.gz")
-    themes_rows = download_csv("themes.csv.gz")
-    inventories_rows = download_csv("inventories.csv.gz")
-    minifig_rows = download_csv("inventory_minifigs.csv.gz")
-
-    print("Processing ...")
-
-    # Step 1: Theme hierarchy
-    theme_lookup = build_theme_lookup(themes_rows)
-
-    # Step 2: Inventory mapping
-    inv_map = build_inventory_map(inventories_rows)
-
-    # Step 3: Minifig counts
-    mf_counts = build_minifig_counts(minifig_rows)
-
-    # Step 3b: Fetch release dates from Brickset (current + previous year)
-    release_dates: dict[str, str] = {}
-    brickset_api_key = os.environ.get("BRICKSET_API_KEY", "")
-    if brickset_api_key:
-        current_year = datetime.now(timezone.utc).year
-        print("Fetching release dates from Brickset ...")
-        release_dates = fetch_brickset_release_dates(
-            brickset_api_key, [current_year - 1, current_year]
+def load_previous() -> tuple[dict[str, dict], str | None]:
+    """Recover the last build from the published release asset, so a delta has
+    something to merge into. Returns ({}, None) if unavailable, which callers
+    treat as "do a full build"."""
+    try:
+        req = urllib.request.Request(
+            LATEST_RELEASE_URL, headers={"Accept": "application/vnd.github+json"}
         )
-    else:
-        print("BRICKSET_API_KEY not set, skipping release dates")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            release = json.loads(resp.read())
+        assets = release.get("assets") or []
+        if not assets:
+            return {}, None
+        with urllib.request.urlopen(
+            assets[0]["browser_download_url"], timeout=120
+        ) as resp:
+            previous = json.loads(zlib.decompress(resp.read()))
+    except Exception as exc:  # noqa: BLE001 - any failure just means "no baseline"
+        print(f"  no usable previous release ({exc})")
+        return {}, None
 
-    # Step 4: Process sets
-    catalog_sets = []
-    theme_stats = {}  # theme -> {sets: count, subthemes: set(), year_from, year_to}
+    # Only a Brickset-sourced catalog can seed a delta. A v1/v2 asset is
+    # Rebrickable-based and lacks a setID on most entries, so it is refused and
+    # the build falls through to a full pull.
+    if previous.get("version", 1) < 3:
+        print("  previous release predates the Brickset-only build; ignoring it")
+        return {}, None
 
-    for row in sets_rows:
-        set_num = row["set_num"]
-        name = row["name"]
-        year = int(row["year"])
-        theme_id = int(row["theme_id"])
-        num_parts = int(row["num_parts"]) if row["num_parts"] else 0
-        img_url = row["img_url"].strip() if row.get("img_url") else ""
+    entries = {
+        entry_key(e.get("n", ""), e.get("v", 1))
+        : e
+        for e in previous.get("sets", [])
+        if e.get("sid")
+    }
+    synced = previous.get("generated")
+    print(f"  recovered {len(entries)} entries, generated {synced}")
+    return entries, synced
 
-        # Resolve theme/subtheme
-        t_info = theme_lookup.get(theme_id)
-        if not t_info:
-            continue
-        theme = t_info["theme"]
-        subtheme = t_info["subtheme"]
 
-        # Split set number
-        number, variant = split_set_num(set_num)
+def build(api_key: str, force_full: bool, years: str) -> tuple[dict, int, bool]:
+    """Delta where possible, full otherwise. Returns (entries, calls, was_full)."""
+    if not force_full:
+        previous, generated = load_previous()
+        if previous and generated:
+            try:
+                since = (
+                    datetime.fromisoformat(generated.replace("Z", "+00:00"))
+                    - timedelta(days=DELTA_OVERLAP_DAYS)
+                ).strftime("%Y-%m-%d")
+                print(f"Delta build: Brickset changes since {since} ...")
+                delta, calls = fetch_sets(api_key, years, since)
+                previous.update(delta)
+                print(f"  {len(delta)} sets changed, {calls} call(s)")
+                return previous, calls, False
+            except RuntimeError as exc:
+                print(f"  delta failed ({exc}), falling back to a full build")
 
-        # Minifig count
-        inv_id = inv_map.get(set_num)
-        mf = mf_counts.get(inv_id, 0) if inv_id else 0
+    print("Full build: fetching the complete Brickset corpus ...")
+    entries, calls = fetch_sets(api_key, years, None)
+    return entries, calls, True
 
-        # Release date from Brickset
-        rd = release_dates.get(set_num)
 
-        entry = {"n": number, "v": variant, "nm": name, "y": year, "t": theme}
-        if subtheme:
-            entry["st"] = subtheme
-        if num_parts:
-            entry["p"] = num_parts
-        if mf:
-            entry["mf"] = mf
-        if img_url:
-            entry["img"] = img_url
-        if rd:
-            entry["rd"] = rd
+# --------------------------------------------------------------------------
+# Assembly
+# --------------------------------------------------------------------------
 
-        catalog_sets.append(entry)
 
-        # Track theme stats
-        if theme not in theme_stats:
-            theme_stats[theme] = {
+def build_themes(sets: list[dict]) -> list[dict]:
+    """Theme summaries, derived from the sets themselves."""
+    stats: dict[str, dict] = {}
+    for s in sets:
+        theme, year = s["t"], s["y"]
+        if theme not in stats:
+            stats[theme] = {
                 "count": 0,
                 "subthemes": set(),
                 "year_from": year,
                 "year_to": year,
             }
-        ts = theme_stats[theme]
+        ts = stats[theme]
         ts["count"] += 1
-        if subtheme:
-            ts["subthemes"].add(subtheme)
+        if s.get("st"):
+            ts["subthemes"].add(s["st"])
         ts["year_from"] = min(ts["year_from"], year)
         ts["year_to"] = max(ts["year_to"], year)
 
-    # Step 5: Build theme summaries
-    catalog_themes = []
-    for t_name, stats in sorted(theme_stats.items()):
-        catalog_themes.append(
-            {
-                "t": t_name,
-                "sc": stats["count"],
-                "stc": len(stats["subthemes"]),
-                "yf": stats["year_from"],
-                "yt": stats["year_to"],
-            }
-        )
+    return [
+        {
+            "t": name,
+            "sc": st["count"],
+            "stc": len(st["subthemes"]),
+            "yf": st["year_from"],
+            "yt": st["year_to"],
+        }
+        for name, st in sorted(stats.items())
+    ]
 
-    # Step 6: Write output
+
+def main():
+    parser = argparse.ArgumentParser(description="Build the Brickman catalog.")
+    parser.add_argument("output", nargs="?", default="catalog.json.z")
+    parser.add_argument(
+        "--full", action="store_true", help="force a complete rebuild (~47 API calls)"
+    )
+    parser.add_argument(
+        "--years", help="comma-delimited year filter, for testing (default: all)"
+    )
+    args = parser.parse_args()
+
+    api_key = os.environ.get("BRICKSET_API_KEY", "")
+    if not api_key:
+        raise SystemExit("BRICKSET_API_KEY is not set — nothing to build from.")
+
+    try:
+        entries, calls, was_full = build(api_key, args.full, args.years or all_years())
+    except RuntimeError as exc:
+        # Publishing an empty or half-built catalog would strip the app's whole
+        # search and browse corpus, so fail the run and leave the last good
+        # release in place instead.
+        raise SystemExit(f"Build failed, keeping the previous release: {exc}")
+
+    catalog_sets = sorted(entries.values(), key=lambda e: (e["y"], e["n"], e["v"]))
+    if not catalog_sets:
+        raise SystemExit("Build produced no sets, keeping the previous release.")
+
     catalog = {
-        "version": 1,
+        "version": 3,
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sets": catalog_sets,
-        "themes": catalog_themes,
+        "themes": build_themes(catalog_sets),
     }
 
-    json_bytes = json.dumps(catalog, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    json_bytes = json.dumps(catalog, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
     compressed = zlib.compress(json_bytes, level=9)
-    with open(output_path, "wb") as f:
+    with open(args.output, "wb") as f:
         f.write(compressed)
 
-    # Report
-    print(f"Done: {len(catalog_sets)} sets, {len(catalog_themes)} themes")
+    total = len(catalog_sets)
+    def pct(n):
+        return f"{n} ({100 * n / total:.1f}%)"
+
+    print(f"\nDone: {total} sets, {len(catalog['themes'])} themes"
+          f"  [{'full' if was_full else 'delta'}, {calls} getSets call(s)]")
+    print(f"  real setID:    {pct(sum(1 for s in catalog_sets if s.get('sid')))}")
+    print(f"  release date:  {pct(sum(1 for s in catalog_sets if s.get('rd')))}")
+    print(f"  released flag: {pct(sum(1 for s in catalog_sets if 'rel' in s))}")
+    print(f"  image:         {pct(sum(1 for s in catalog_sets if s.get('img')))}")
+    print(f"  category:      {pct(sum(1 for s in catalog_sets if s.get('cat')))}")
     print(f"Raw JSON:   {len(json_bytes) / 1024 / 1024:.1f} MB")
-    print(f"Compressed: {len(compressed) / 1024 / 1024:.1f} MB → {output_path}")
+    print(f"Compressed: {len(compressed) / 1024 / 1024:.1f} MB → {args.output}")
 
 
 if __name__ == "__main__":
