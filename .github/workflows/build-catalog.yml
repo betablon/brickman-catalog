@@ -2,11 +2,27 @@ name: Build Catalog
 
 on:
   schedule:
-    - cron: "0 6 * * 1" # Monday 06:00 UTC
+    # Daily delta. Costs ~1 getSets call — the app's own traffic peaks at 14
+    # against a 100/day cap, so this is comfortably inside the free tier.
+    - cron: "0 6 * * *"
+    # Quarterly full overlay refresh (~47 calls). Not needed for currency —
+    # updatedSince picks up edits to old sets perfectly well — but each delta is
+    # seeded from the previous release, so this bounds how long a corrupt link
+    # or a set deleted upstream can persist in the chain.
+    - cron: "0 5 1 1,4,7,10 *"
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Force a full Brickset overlay refresh (~47 API calls)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-catalog
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -21,13 +37,22 @@ jobs:
       - name: Build catalog
         env:
           BRICKSET_API_KEY: ${{ secrets.BRICKSET_API_KEY }}
-        run: python scripts/build_catalog.py catalog.json.z
+          # The quarterly cron and a manual run with the box ticked do a full
+          # pull; every other run is a delta seeded from the last release.
+          # This string must stay identical to the quarterly cron above.
+          FULL: ${{ github.event.schedule == '0 5 1 1,4,7,10 *' || inputs.full }}
+        run: |
+          if [ "$FULL" = "true" ]; then
+            python scripts/build_catalog.py --full catalog.json.z
+          else
+            python scripts/build_catalog.py catalog.json.z
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: catalog-${{ github.run_number }}
           name: Catalog ${{ github.run_number }}
-          body: "Automated weekly catalog update"
+          body: "Automated catalog update"
           files: catalog.json.z
           make_latest: true
