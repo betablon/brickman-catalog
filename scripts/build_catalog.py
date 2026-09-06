@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import time
@@ -120,8 +121,10 @@ def to_entry(s: dict) -> dict | None:
     required by the app's decoder, everything else is omitted when absent.
     """
     number = str(s.get("number") or "").strip()
-    name = s.get("name")
-    theme = s.get("theme")
+    # Brickset carries trailing whitespace on some theme names ("Promotional ")
+    # as well as on numbers, which splits a theme into two on any exact match.
+    name = (s.get("name") or "").strip()
+    theme = (s.get("theme") or "").strip()
     year = s.get("year")
     set_id = s.get("setID")
 
@@ -146,8 +149,8 @@ def to_entry(s: dict) -> dict | None:
         "sid": set_id,
     }
 
-    if s.get("subtheme"):
-        entry["st"] = s["subtheme"]
+    if (s.get("subtheme") or "").strip():
+        entry["st"] = s["subtheme"].strip()
     if isinstance(s.get("pieces"), int) and s["pieces"] > 0:
         entry["p"] = s["pieces"]
     if isinstance(s.get("minifigs"), int) and s["minifigs"] > 0:
@@ -286,6 +289,42 @@ def build(api_key: str, force_full: bool, years: str) -> tuple[dict, int, bool]:
 # --------------------------------------------------------------------------
 
 
+def canonicalise_themes(sets: list[dict]) -> int:
+    """Collapse case-variant theme names onto one spelling, in place.
+
+    Brickset holds both "DUPLO" (1 set) and "Duplo" (1,377), plus LEGOLAND and
+    NEXO KNIGHTS in two casings each. Left alone they browse as two rows, split
+    the set counts, and — because followed themes are keyed by name — a follow
+    on one spelling never sees sets filed under the other. The spelling used by
+    the most sets wins.
+    """
+    variants: dict[str, collections.Counter] = collections.defaultdict(
+        collections.Counter
+    )
+    for s in sets:
+        variants[s["t"].casefold()][s["t"]] += 1
+
+    canonical = {
+        key: counts.most_common(1)[0][0]
+        for key, counts in variants.items()
+        if len(counts) > 1
+    }
+    if not canonical:
+        return 0
+
+    changed = 0
+    for s in sets:
+        winner = canonical.get(s["t"].casefold())
+        if winner and winner != s["t"]:
+            s["t"] = winner
+            changed += 1
+
+    for key, winner in canonical.items():
+        losers = [v for v in variants[key] if v != winner]
+        print(f"  theme {winner!r} absorbed {losers}")
+    return changed
+
+
 def build_themes(sets: list[dict]) -> list[dict]:
     """Theme summaries, derived from the sets themselves."""
     stats: dict[str, dict] = {}
@@ -343,6 +382,8 @@ def main():
     catalog_sets = sorted(entries.values(), key=lambda e: (e["y"], e["n"], e["v"]))
     if not catalog_sets:
         raise SystemExit("Build produced no sets, keeping the previous release.")
+
+    canonicalise_themes(catalog_sets)
 
     catalog = {
         "version": 3,
