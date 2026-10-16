@@ -209,14 +209,20 @@ def to_entry(s: dict) -> dict | None:
         if positive(price):
             entry[key] = price
 
-    # When the set left sale, so the app can tell retired sets from current
-    # ones. Brickset's own exitDate leads, as launchDate does for "rd".
+    # When the set leaves sale: LEGO's planned exit date, so often still
+    # ahead (the UCS Millennium Falcon's was 2026-12-31), which is what lets
+    # the app say a set is retiring soon.
+    #
+    # LEGO.com's dateLastAvailable is only a fallback, and only once the set
+    # has gone from every region it was sold in. A single region's date just
+    # means it sold out there: the Falcon had a US date in October 2026 while
+    # still on sale in the UK and Germany.
     exit_date = s.get("exitDate")
     if not exit_date:
-        for region in ("US", "UK", "DE"):
-            exit_date = (lego_com.get(region) or {}).get("dateLastAvailable")
-            if exit_date:
-                break
+        sold = [r for r in lego_com.values() if isinstance(r, dict) and r.get("dateFirstAvailable")]
+        lasts = [r.get("dateLastAvailable") for r in sold]
+        if sold and all(lasts):
+            exit_date = max(lasts)
     if exit_date:
         entry["xd"] = exit_date
 
