@@ -11,6 +11,7 @@ no longer needs a blocking API round trip to resolve its real ID.
 Quota: only getSets counts against the key, and the default cap is 100/day.
   * a full build is ~47 calls  (23,500 sets at pageSize 500)
   * a delta build is ~1 call   (updatedSince, seeded from the last release)
+  * the first run after a CATALOG_VERSION bump is a full build
 
 An unfiltered getSets is rejected ("No valid parameters"), but `year` accepts a
 comma-delimited list, so the whole corpus pages as a single query.
@@ -55,6 +56,18 @@ PAGE_SIZE = 500
 # How far back a delta reaches beyond the last build, as insurance against a
 # missed or partial run.
 DELTA_OVERLAP_DAYS = 3
+
+# Bumped whenever entries gain a field that a delta can't backfill, since a
+# delta only rewrites the sets Brickset changed. A release older than this is
+# refused as a baseline, so the next run is a full build.
+#   3: Brickset-sourced, with real setIDs
+#   4: retail prices, barcodes, rating, age range, packaging, availability,
+#      exit date, and owned/wanted counts
+CATALOG_VERSION = 4
+
+# LEGO.com regions priced in the catalog, and the key each is stored under.
+# These are the three the app offers as currencies.
+PRICE_REGIONS = (("US", "pus"), ("UK", "puk"), ("DE", "pde"))
 
 
 # --------------------------------------------------------------------------
@@ -114,6 +127,21 @@ def entry_key(number: str, variant) -> str:
     return f"{str(number).strip()}-{v}"
 
 
+def positive(value) -> bool:
+    """A real number above zero. Brickset sends 0 for "unknown", and bool is
+    an int in Python, so it's ruled out by name."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def known_text(value) -> str | None:
+    """Stripped text, or None for nothing or one of Brickset's braced
+    placeholders such as "{Not specified}" or "{?}"."""
+    text = (value or "").strip() if isinstance(value, str) else ""
+    if not text or text.startswith("{"):
+        return None
+    return text
+
+
 def to_entry(s: dict) -> dict | None:
     """Reduce a Brickset record to the compact catalog shape.
 
@@ -160,17 +188,68 @@ def to_entry(s: dict) -> dict | None:
     if image.get("imageURL"):
         entry["img"] = image["imageURL"]
 
+    lego_com = s.get("LEGOCom") or {}
+
     # launchDate covers ~84% of recent sets against ~72% for the LEGO.com
     # per-region dateFirstAvailable, so it leads and the regional date backfills.
     date = s.get("launchDate")
     if not date:
-        lego_com = s.get("LEGOCom") or {}
         for region in ("US", "UK", "DE"):
             date = (lego_com.get(region) or {}).get("dateFirstAvailable")
             if date:
                 break
     if date:
         entry["rd"] = date
+
+    # Retail prices, so a set opened from browsing shows its RRP without the
+    # app spending an API call. Brickset sends 0 or nothing for an unpriced
+    # region, and both are left out.
+    for region, key in PRICE_REGIONS:
+        price = (lego_com.get(region) or {}).get("retailPrice")
+        if positive(price):
+            entry[key] = price
+
+    # When the set left sale, so the app can tell retired sets from current
+    # ones. Brickset's own exitDate leads, as launchDate does for "rd".
+    exit_date = s.get("exitDate")
+    if not exit_date:
+        for region in ("US", "UK", "DE"):
+            exit_date = (lego_com.get(region) or {}).get("dateLastAvailable")
+            if exit_date:
+                break
+    if exit_date:
+        entry["xd"] = exit_date
+
+    # Box barcodes, so a scan is a catalog lookup rather than a getSets call
+    # against the daily cap, and works without signal.
+    barcode = s.get("barcode") or {}
+    for field, key in (("EAN", "ean"), ("UPC", "upc")):
+        code = known_text(barcode.get(field))
+        if code:
+            entry[key] = code
+
+    # Details the set screen already shows for a saved set, so a browsed set
+    # reads the same.
+    if positive(s.get("rating")):
+        entry["rt"] = round(s["rating"], 2)
+    if positive(s.get("reviewCount")):
+        entry["rc"] = s["reviewCount"]
+    age_range = s.get("ageRange") or {}
+    if positive(age_range.get("min")):
+        entry["amn"] = age_range["min"]
+    if positive(age_range.get("max")):
+        entry["amx"] = age_range["max"]
+    if known_text(s.get("packagingType")):
+        entry["pkg"] = known_text(s["packagingType"])
+    if known_text(s.get("availability")):
+        entry["av"] = known_text(s["availability"])
+
+    # How many Brickset members own and want the set: a popularity signal.
+    collections = s.get("collections") or {}
+    if positive(collections.get("ownedBy")):
+        entry["ob"] = collections["ownedBy"]
+    if positive(collections.get("wantedBy")):
+        entry["wb"] = collections["wantedBy"]
 
     if isinstance(s.get("released"), bool):
         entry["rel"] = s["released"]
@@ -243,11 +322,14 @@ def load_previous() -> tuple[dict[str, dict], str | None]:
         print(f"  no usable previous release ({exc})")
         return {}, None
 
-    # Only a Brickset-sourced catalog can seed a delta. A v1/v2 asset is
-    # Rebrickable-based and lacks a setID on most entries, so it is refused and
-    # the build falls through to a full pull.
-    if previous.get("version", 1) < 3:
-        print("  previous release predates the Brickset-only build; ignoring it")
+    # Only a release of the current shape can seed a delta. A v1/v2 asset is
+    # Rebrickable-based and lacks a setID on most entries; a v3 one has no
+    # prices, which a delta would only add to the sets that happened to change.
+    # Either way the build falls through to a full pull.
+    version = previous.get("version", 1)
+    if version < CATALOG_VERSION:
+        print(f"  previous release is catalog v{version}, older than "
+              f"v{CATALOG_VERSION}; ignoring it")
         return {}, None
 
     entries = {
@@ -386,7 +468,7 @@ def main():
     canonicalise_themes(catalog_sets)
 
     catalog = {
-        "version": 3,
+        "version": CATALOG_VERSION,
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sets": catalog_sets,
         "themes": build_themes(catalog_sets),
@@ -410,6 +492,19 @@ def main():
     print(f"  released flag: {pct(sum(1 for s in catalog_sets if 'rel' in s))}")
     print(f"  image:         {pct(sum(1 for s in catalog_sets if s.get('img')))}")
     print(f"  category:      {pct(sum(1 for s in catalog_sets if s.get('cat')))}")
+    for region, key in PRICE_REGIONS:
+        print(f"  price {region}:      {pct(sum(1 for s in catalog_sets if key in s))}")
+    for label, keys in (
+        ("barcode", ("ean", "upc")),
+        ("rating", ("rt",)),
+        ("age range", ("amn",)),
+        ("packaging", ("pkg",)),
+        ("availability", ("av",)),
+        ("exit date", ("xd",)),
+        ("owned by", ("ob",)),
+    ):
+        count = sum(1 for s in catalog_sets if any(k in s for k in keys))
+        print(f"  {label + ':':<15}{pct(count)}")
     print(f"Raw JSON:   {len(json_bytes) / 1024 / 1024:.1f} MB")
     print(f"Compressed: {len(compressed) / 1024 / 1024:.1f} MB → {args.output}")
 
