@@ -48,11 +48,20 @@ jobs:
             python scripts/build_catalog.py catalog.json.z
           fi
 
+      # The animal catalog, from Rebrickable's bulk downloads. On a failure
+      # the script republishes the previous release's file, and should even
+      # that fail, the sets catalog still goes out without it.
+      - name: Build animals
+        continue-on-error: true
+        run: python scripts/build_animals.py animals.json.z
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: catalog-${{ github.run_number }}
           name: Catalog ${{ github.run_number }}
           body: "Automated catalog update"
-          files: catalog.json.z
+          files: |
+            catalog.json.z
+            animals.json.z
           make_latest: true

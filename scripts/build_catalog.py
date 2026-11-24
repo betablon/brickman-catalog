@@ -317,7 +317,10 @@ def load_previous() -> tuple[dict[str, dict], str | None]:
         )
         with urllib.request.urlopen(req, timeout=60) as resp:
             release = json.loads(resp.read())
-        assets = release.get("assets") or []
+        # By name: a release also carries animals.json.z, in no set order.
+        assets = [
+            a for a in release.get("assets") or [] if a.get("name") == "catalog.json.z"
+        ]
         if not assets:
             return {}, None
         with urllib.request.urlopen(
